@@ -5,9 +5,9 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping
 
-from field_feedback.observations.report import Decision, DomainRecord, ContractError, canonical_json, stable_hash, utc_now
+from field_feedback.observations.report import Decision, DomainRecord, ContractError, RuleResult, canonical_json, stable_hash, utc_now
 
 
 SCHEMA = """
@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS decisions(
     score REAL NOT NULL,
     decision_json TEXT NOT NULL,
     decided_at TEXT NOT NULL,
+    record_version INTEGER,
+    record_fingerprint TEXT,
     FOREIGN KEY(record_id) REFERENCES records(record_id)
 );
 CREATE TABLE IF NOT EXISTS events(
@@ -83,6 +85,11 @@ class Repository:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(decisions)")}
+            if "record_version" not in columns:
+                connection.execute("ALTER TABLE decisions ADD COLUMN record_version INTEGER")
+            if "record_fingerprint" not in columns:
+                connection.execute("ALTER TABLE decisions ADD COLUMN record_fingerprint TEXT")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -162,18 +169,49 @@ class Repository:
                              state=row["state"], version=row["version"], occurred_at=row["occurred_at"],
                              source=row["source"]) for row in rows]
 
-    def save_decision(self, decision: Decision) -> str:
+    def save_decision(self, decision: Decision, record: DomainRecord | None = None) -> str:
         decision_id = decision.fingerprint
         with self.transaction() as connection:
             if not connection.execute("SELECT 1 FROM records WHERE record_id=?", (decision.record_id,)).fetchone():
                 raise ContractError("decision record does not exist")
             body = canonical_json(decision.as_dict())
-            connection.execute("INSERT OR IGNORE INTO decisions(decision_id,record_id,outcome,score,decision_json,decided_at) VALUES(?,?,?,?,?,?)",
-                               (decision_id, decision.record_id, decision.outcome, decision.score, body, decision.decided_at))
+            record_version = record.version if record is not None else None
+            record_fingerprint = record.fingerprint if record is not None else None
+            connection.execute(
+                "INSERT OR IGNORE INTO decisions(decision_id,record_id,outcome,score,decision_json,decided_at,"
+                "record_version,record_fingerprint) VALUES(?,?,?,?,?,?,?,?)",
+                (decision_id, decision.record_id, decision.outcome, decision.score, body, decision.decided_at,
+                 record_version, record_fingerprint))
             self.append_event(connection, "decision.saved", decision.record_id,
                               self.event_count(decision.record_id, connection) + 1,
                               {"decision_id": decision_id, "outcome": decision.outcome, "score": decision.score})
         return decision_id
+
+    def attach_decision_to_record(self, decision_id: str, record: DomainRecord) -> None:
+        """把已落库决策的可追溯锚点指向最终报告版本（状态推进后的记录）。"""
+        with self.transaction() as connection:
+            changed = connection.execute(
+                "UPDATE decisions SET record_version=?, record_fingerprint=? WHERE decision_id=?",
+                (record.version, record.fingerprint, decision_id)).rowcount
+            if changed != 1:
+                raise ContractError("decision does not exist")
+
+    def current_decision_for(self, record: DomainRecord) -> Decision | None:
+        """返回与当前报告版本完全匹配的既有决策；不存在或已过期则返回 None。"""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT decision_json FROM decisions WHERE record_id=? AND record_version=? AND record_fingerprint=? "
+                "ORDER BY decided_at DESC, decision_id DESC LIMIT 1",
+                (record.record_id, record.version, record.fingerprint)).fetchone()
+        if row is None:
+            return None
+        body = json.loads(row["decision_json"])
+        return Decision(record_id=body["record_id"], outcome=body["outcome"], score=body["score"],
+                        reasons=tuple(body["reasons"]),
+                        rule_results=tuple(RuleResult(code=item["code"], passed=item["passed"], score=item["score"],
+                                                      severity=item["severity"], message=item["message"],
+                                                      evidence=item.get("evidence", {})) for item in body["rules"]),
+                        metrics=body["metrics"], decided_at=body["decided_at"])
 
     def event_count(self, aggregate_id: str, connection: sqlite3.Connection | None = None) -> int:
         owns = connection is None
