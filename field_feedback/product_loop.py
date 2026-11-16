@@ -9,11 +9,15 @@ from field_feedback.history.release_archive import Repository
 from field_feedback.releases.progressive_delivery import advance_for_outcome, decide
 from field_feedback.insights.regional_digest import export_bundle, verify_bundle
 from field_feedback.triage.multilingual_clusters import derive_context
+from field_feedback.releases.fleet_delivery import FleetDelivery
+from field_feedback.releases.evidence_review import EvidenceReview
 
 
 class Application:
     def __init__(self, database: str | Path, context: Mapping[str, Any] | None = None):
         self.repository = Repository(database)
+        self.fleet_delivery = FleetDelivery(self.repository)
+        self.evidence_review = EvidenceReview(self.repository,self.fleet_delivery)
         self.context = dict(context or {})
 
     def ingest(self, record: DomainRecord) -> DomainRecord:
@@ -37,6 +41,7 @@ class Application:
         advanced = advance_for_outcome(stored, decision)
         if advanced.fingerprint != stored.fingerprint:
             self.repository.save_record(advanced, expected_version=stored.version)
+        self.fleet_delivery.reconcile(advanced, decision)
         return advanced, decision
 
     def run_fixture(self, fixture: Mapping[str, Any], output: str | Path) -> dict[str, Any]:
@@ -53,6 +58,7 @@ class Application:
             final_records.append(final_record)
             decisions[record.record_id] = decision
         snapshot = self.repository.snapshot()
+        snapshot["fleet_delivery"] = self.fleet_delivery.inspect()
         if snapshot["chain_errors"]:
             raise ContractError("audit chain verification failed")
         manifest = export_bundle(output, final_records, decisions, snapshot, self.repository.event_rows())
@@ -63,7 +69,7 @@ class Application:
 
     def inspect(self) -> dict[str, Any]:
         return {"snapshot": self.repository.snapshot(), "records": [record.__dict__ for record in self.repository.list_records()],
-                "decisions": self.repository.decision_rows()}
+                "decisions": self.repository.decision_rows(), "fleet_delivery": self.fleet_delivery.inspect()}
 
 
 def load_fixture(path: str | Path) -> dict[str, Any]:
